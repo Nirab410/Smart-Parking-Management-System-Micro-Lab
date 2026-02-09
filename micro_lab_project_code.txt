@@ -1,0 +1,300 @@
+#include <ESP32Servo.h>
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+#include <SPI.h>
+#include <MFRC522.h>
+
+// ------------------ LCD ------------------
+LiquidCrystal_I2C lcd(0x27, 16, 2);  // change 0x27 to 0x3F if your LCD uses that
+
+// ------------------ RFID (MFRC522) ------------------
+#define RST_PIN  4
+#define SS_PIN   5
+MFRC522 mfrc522(SS_PIN, RST_PIN);
+
+// ------------------ Servo pins ------------------
+// Physical order at ENTRY side: RFID -> Entry gate -> Entry IR -> parking
+const int ENTRY_SERVO_PIN = 14;
+const int EXIT_SERVO_PIN  = 27;
+
+Servo entryServo;
+Servo exitServo;
+
+// ------------------ Sensors & buzzer pins ------------------
+const int IR_ENTRY_PIN  = 32;   // entry IR sensor (active LOW when car present, placed AFTER gate)
+const int IR_EXIT_PIN   = 33;   // exit IR sensor (active LOW when car present)
+const int GAS_PIN       = 34;   // analog gas sensor
+const int FLAME_PIN     = 35;   // digital flame sensor (active LOW)
+const int BUZZER_PIN    = 26;   // buzzer
+
+// ------------------ Parking logic ------------------
+const int TOTAL_SLOTS = 4;   // 4 parking slots
+int carCount = 0;            // current number of cars inside
+
+// For IR edge detection
+int lastEntryIRState = HIGH;
+int lastExitIRState  = HIGH;
+
+// Entry authorization state
+bool entryAuthorized = false;
+
+// Gas sensor threshold (tune for your sensor; 0–4095)
+const int GAS_THRESHOLD = 2000;
+
+// ------------------ Helper functions ------------------
+
+int availableSlots() {
+  int freeSlots = TOTAL_SLOTS - carCount;
+  if (freeSlots < 0) freeSlots = 0;
+  return freeSlots;
+}
+
+void openEntryGate() {
+  entryServo.write(90);    // adjust angle to match your mechanical setup
+}
+
+void closeEntryGate() {
+  entryServo.write(0);
+}
+
+void openExitGate() {
+  exitServo.write(90);
+}
+
+void closeExitGate() {
+  exitServo.write(0);
+}
+
+void buzzerOn() {
+  digitalWrite(BUZZER_PIN, HIGH);
+}
+
+void buzzerOff() {
+  digitalWrite(BUZZER_PIN, LOW);
+}
+
+void shortBeep(int ms) {
+  buzzerOn();
+  delay(ms);
+  buzzerOff();
+}
+
+// Normal mode display: show cars and free slots
+void updateDisplay() {
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("Cars:");
+  lcd.print(carCount);
+  lcd.print(" Slots:");
+  lcd.print(availableSlots());
+
+  lcd.setCursor(0, 1);
+  lcd.print("Entry/Exit Ready");
+}
+
+// No slot available message (3 seconds)
+void showNoSlotMessage() {
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("No Slot");
+  lcd.setCursor(0, 1);
+  lcd.print("Available");
+  buzzerOn();
+  delay(3000);
+  buzzerOff();
+  updateDisplay();
+}
+
+// Invalid card message
+void showInvalidCardMessage() {
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("Access Denied");
+  lcd.setCursor(0, 1);
+  lcd.print("Invalid Card");
+  buzzerOn();
+  delay(2000);
+  buzzerOff();
+  updateDisplay();
+}
+
+// Fire alert: open all gates, sound buzzer, show alert
+void showFireAlert() {
+  openEntryGate();
+  openExitGate();
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("Alert");
+  lcd.setCursor(0, 1);
+  lcd.print("Fire detected");
+  buzzerOn();
+  delay(200);  // small delay to reduce flicker
+}
+
+// Gas alert: open all gates, sound buzzer, show alert
+void showGasAlert() {
+  openEntryGate();
+  openExitGate();
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("Alert");
+  lcd.setCursor(0, 1);
+  lcd.print("Gas detected");
+  buzzerOn();
+  delay(200);
+}
+
+// Check if UID is authorized
+bool isAuthorizedUID(const String &uidStr) {
+  // -------------- IMPORTANT --------------
+  // Replace these example UIDs with your real card UIDs (uppercase, no spaces)
+  const String AUTH_UID_1 = "19754814";  // example only
+  const String AUTH_UID_2 = "A1B2C3D4";  // example only
+  // --------------------------------------
+
+  if (uidStr == AUTH_UID_1) return true;
+  if (uidStr == AUTH_UID_2) return true;
+  return false;
+}
+
+// Read RFID card and handle entry authorization
+// (Reader is before gate and before entry IR)
+void checkRFID() {
+  if (!mfrc522.PICC_IsNewCardPresent()) return;
+  if (!mfrc522.PICC_ReadCardSerial())   return;
+
+  // Build UID string
+  String uidStr = "";
+  for (byte i = 0; i < mfrc522.uid.size; i++) {
+    byte b = mfrc522.uid.uidByte[i];
+    if (b < 0x10) uidStr += "0";
+    uidStr += String(b, HEX);
+  }
+  uidStr.toUpperCase();
+
+  if (isAuthorizedUID(uidStr)) {
+    if (availableSlots() > 0) {
+      // Correct card and free slot -> open entry gate
+      entryAuthorized = true;
+      openEntryGate();
+
+      lcd.clear();
+      lcd.setCursor(0, 0);
+      lcd.print("Card OK");
+      lcd.setCursor(0, 1);
+      lcd.print("Please Enter");
+      shortBeep(200);
+      delay(500);  // brief info then return to normal display
+      updateDisplay();
+    } else {
+      // No slots left
+      showNoSlotMessage();
+      entryAuthorized = false;
+    }
+  } else {
+    // Unauthorized card
+    showInvalidCardMessage();
+    entryAuthorized = false;
+  }
+
+  // Halt PICC
+  mfrc522.PICC_HaltA();
+  mfrc522.PCD_StopCrypto1();
+}
+
+// Handle entry IR: placed AFTER gate, counts car as it goes in
+void handleEntryIR() {
+  int currentState = digitalRead(IR_ENTRY_PIN);  // LOW when car present
+
+  // Detect falling edge (HIGH -> LOW) AND only if an entry was authorized
+  if (entryAuthorized && lastEntryIRState == HIGH && currentState == LOW) {
+    // Car is entering the parking area now
+    if (carCount < TOTAL_SLOTS) {
+      carCount++;           // increase cars
+    }
+    updateDisplay();        // LCD updates immediately
+    delay(1000);            // allow car to clear the gate
+    closeEntryGate();       // close gate after car has passed IR
+    entryAuthorized = false;
+  }
+
+  lastEntryIRState = currentState;
+}
+
+// Handle exit IR: placed before exit gate or at exit lane
+void handleExitIR() {
+  int currentState = digitalRead(IR_EXIT_PIN);  // LOW when car present
+
+  // Detect falling edge (HIGH -> LOW)
+  if (lastExitIRState == HIGH && currentState == LOW) {
+    if (carCount > 0) {
+      carCount--;          // car leaving -> free a slot
+    }
+    openExitGate();
+    updateDisplay();
+    delay(1000);           // let car go out
+    closeExitGate();
+  }
+
+  lastExitIRState = currentState;
+}
+
+// ------------------ SETUP ------------------
+void setup() {
+  Serial.begin(115200);
+
+  // Servos
+  entryServo.attach(ENTRY_SERVO_PIN);
+  exitServo.attach(EXIT_SERVO_PIN);
+  closeEntryGate();
+  closeExitGate();
+
+  // Pins
+  pinMode(IR_ENTRY_PIN, INPUT_PULLUP);  // expecting LOW when car present
+  pinMode(IR_EXIT_PIN,  INPUT_PULLUP);  // expecting LOW when car present
+  pinMode(FLAME_PIN,    INPUT_PULLUP);  // expecting LOW when fire
+  pinMode(GAS_PIN,      INPUT);
+  pinMode(BUZZER_PIN,   OUTPUT);
+  buzzerOff();
+
+  // LCD
+  Wire.begin(21, 22);       // SDA, SCL
+  lcd.init();
+  lcd.backlight();
+
+  // RFID
+  SPI.begin();              // VSPI: SCK18, MISO19, MOSI23, SS5
+  mfrc522.PCD_Init();
+
+  updateDisplay();
+}
+
+// ------------------ LOOP ------------------
+void loop() {
+  // ---- Emergency checks first ----
+  bool fireDetected = (digitalRead(FLAME_PIN) == LOW);  // active LOW
+  int gasValue = analogRead(GAS_PIN);
+  bool gasDetected = (gasValue > GAS_THRESHOLD);
+
+  if (fireDetected) {
+    showFireAlert();
+    return;      // while fire present, stay in alert mode
+  }
+
+  if (gasDetected) {
+    showGasAlert();
+    return;      // while gas present, stay in alert mode
+  }
+
+  // Normal mode: buzzer off and gates controlled only by logic
+  buzzerOff();
+
+  // 1) RFID check first (reader is BEFORE gate and IR)
+  checkRFID();
+
+  // 2) Then IR sensors
+  handleEntryIR();  // IR AFTER entry gate: counts cars entering
+  handleExitIR();   // IR at exit: counts cars leaving
+
+  delay(50);
+}
